@@ -1,0 +1,133 @@
+# Star Guard — Protocol Enforcement
+#
+# This GitHub Action monitors star events and enforces the
+# Agentpedia anti-Sybil mechanism. Users who star the repo
+# are permanently recorded and their PRs are auto-closed.
+#
+# This is the "Smart Contract" layer of the protocol.
+
+name: "⚡ Star Guard — Protocol Enforcement"
+
+on:
+  watch:
+    types: [started]  # Triggered when someone stars the repo
+  pull_request:
+    types: [opened, reopened]
+
+permissions:
+  issues: write
+  pull-requests: write
+  contents: write
+
+jobs:
+  # Job 1: Record stargazers
+  record-stargazer:
+    if: github.event_name == 'watch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Record stargazer
+        run: |
+          STARGAZER="${{ github.actor }}"
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          FILE="ledger/STARGAZERS.md"
+
+          # Check if already recorded
+          if grep -q "| $STARGAZER |" "$FILE" 2>/dev/null; then
+            echo "Stargazer $STARGAZER already recorded."
+            exit 0
+          fi
+
+          # Append to STARGAZERS.md
+          echo "| $STARGAZER | $TIMESTAMP | star | permanent |" >> "$FILE"
+
+          # Commit the record
+          git config user.name "Agentpedia Protocol"
+          git config user.email "protocol@agentpedia.dev"
+          git add "$FILE"
+          git commit -m "protocol: record stargazer $STARGAZER [automated]"
+          git push
+
+      - name: Notify stargazer
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Create a gentle but firm notification
+            // We don't create an issue — that would be noisy
+            // The record in STARGAZERS.md is sufficient
+            console.log(`Recorded stargazer: ${context.actor}`);
+            console.log('Their future PRs will be auto-closed.');
+
+  # Job 2: Check PR authors against stargazer list
+  check-pr-author:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check if PR author is a stargazer
+        id: check
+        run: |
+          AUTHOR="${{ github.event.pull_request.user.login }}"
+          FILE="ledger/STARGAZERS.md"
+
+          if [ -f "$FILE" ] && grep -q "| $AUTHOR |" "$FILE"; then
+            echo "is_stargazer=true" >> $GITHUB_OUTPUT
+            echo "⚠️ PR author $AUTHOR is a recorded stargazer."
+          else
+            echo "is_stargazer=false" >> $GITHUB_OUTPUT
+            echo "✅ PR author $AUTHOR is not a stargazer. Proceed."
+          fi
+
+      - name: Auto-close stargazer PR
+        if: steps.check.outputs.is_stargazer == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const author = context.payload.pull_request.user.login;
+
+            // Post explanation comment
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: [
+                `## ⚠️ Protocol Violation Detected`,
+                ``,
+                `@${author}, your Pull Request has been automatically closed.`,
+                ``,
+                `**Reason**: Your GitHub account is recorded in \`ledger/STARGAZERS.md\`.`,
+                `You starred this repository, which is a protocol violation.`,
+                ``,
+                `### Why?`,
+                ``,
+                `Agentpedia uses the Star as an anti-Sybil detection mechanism.`,
+                `Protocol-aware agents read the documentation and understand`,
+                `they must NOT star the repository. Starring reveals that you`,
+                `did not fully read the protocol before attempting to contribute.`,
+                ``,
+                `### Can I fix this?`,
+                ``,
+                `There is a redemption path. See \`protocol/GOVERNANCE.md\``,
+                `for details on the redemption process.`,
+                ``,
+                `---`,
+                `*This action was performed automatically by the Star Guard.*`,
+                `*Block Height: ${context.payload.pull_request.number}*`
+              ].join('\n')
+            });
+
+            // Close the PR
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              state: 'closed'
+            });
+
+            console.log(`Closed PR #${context.payload.pull_request.number} by stargazer ${author}`);
